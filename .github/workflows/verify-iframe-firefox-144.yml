@@ -17,24 +17,28 @@ jobs:
       fail-fast: false
       matrix:
         browser: [chrome, firefox]
-        implementation: [patched, upstream, diagnostic]
+        implementation: [patched, upstream, submitted, diagnostic]
     container:
       image: cypress/browsers:node-22.21.0-chrome-141.0.7390.107-1-ff-144.0-edge-141.0.3537.92-1
       options: --user 1001 --shm-size=2g
     env:
       CYPRESS_BROWSER: ${{ matrix.browser }}
       VERIFY_IMPLEMENTATION: ${{ matrix.implementation }}
-      VERIFY_SPEC: ${{ matrix.implementation == 'patched' && 'cypress/e2e/document.cy.js,cypress/e2e/focus-trap-demo.cy.js' || matrix.implementation == 'upstream' && 'cypress/e2e/document.cy.js' || 'cypress/e2e/iframe-lifecycle-diagnostic.cy.js' }}
+      VERIFY_SPEC: ${{ matrix.implementation == 'patched' && 'cypress/e2e/document.cy.js,cypress/e2e/focus-trap-demo.cy.js' || matrix.implementation == 'diagnostic' && 'cypress/e2e/iframe-lifecycle-diagnostic.cy.js' || 'cypress/e2e/document.cy.js' }}
     steps:
       - name: Checkout isolated verification branch
         uses: actions/checkout@v3
         with:
-          fetch-depth: 3
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Revert only production code for regression sensitivity
         if: matrix.implementation == 'upstream'
         run: git show 4db600b20240da1455fc0d899610b60b1c4cd576:index.js > index.js
+
+      - name: Restore submitted production code for removal regression sensitivity
+        if: matrix.implementation == 'submitted'
+        run: git show c84c7a6ef0cf6ad45bcaa15cbe25495f44cc0075:index.js > index.js
 
       - name: Record source and exact browser versions
         run: |
@@ -47,7 +51,7 @@ jobs:
 
       - name: Run Cypress with no retries
         id: cypress
-        continue-on-error: ${{ matrix.implementation == 'upstream' }}
+        continue-on-error: ${{ matrix.implementation == 'upstream' || matrix.implementation == 'submitted' }}
         uses: cypress-io/github-action@v5
         with:
           start: npm run start:cypress
@@ -59,36 +63,53 @@ jobs:
         env:
           CYPRESS_OUTCOME: ${{ steps.cypress.outcome }}
         run: |
-          python3 - <<'PY'
-          import glob, json, os, re
-          import xml.etree.ElementTree as ET
-          from pathlib import Path
-          paths = glob.glob('results/junit-*.xml')
-          cases = [case for path in paths for case in ET.parse(path).findall('.//testcase')]
-          failures = [failure for case in cases for failure in case.findall('failure')]
-          skipped = [skip for case in cases for skip in case.findall('skipped')]
-          mode = os.environ['VERIFY_IMPLEMENTATION']
-          assert paths, 'No JUnit results were produced'
-          assert not skipped, 'No skipped tests are allowed'
-          if mode == 'upstream':
-              assert os.environ['CYPRESS_OUTCOME'] == 'failure'
-              assert len(cases) == 1 and len(failures) == 1, (len(cases), len(failures))
-              failure = failures[0].get('message', '') + '\n' + (failures[0].text or '')
-              assert re.search(r'selectionStart.*value 5.*value was 0', failure, re.S), failure
-              assert 'detached' not in failure.lower(), failure
-              result = 'Expected regression reproduced: selectionStart is 0 instead of 5.'
-          else:
-              assert os.environ['CYPRESS_OUTCOME'] == 'success'
-              expected = 46 if mode == 'patched' else 1
-              assert len(cases) == expected and not failures, (len(cases), len(failures))
-              result = f'{len(cases)} tests passed with no failures or skips.'
-              if mode == 'diagnostic':
-                  result += '\n' + Path('results/iframe-lifecycle.json').read_text()
-          print(result)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write(result + '\n')
-          Path('results/verification-result.txt').write_text(result + '\n')
-          PY
+          node <<'JS'
+          const assert = require('node:assert/strict');
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const { JSDOM } = require('jsdom');
+          const paths = fs.readdirSync('results').filter(path => /^junit-.*\.xml$/.test(path));
+          const documents = paths.map(path => new JSDOM(fs.readFileSync(`results/${path}`, 'utf8'), { contentType: 'text/xml' }).window.document);
+          const cases = documents.flatMap(doc => Array.from(doc.querySelectorAll('testcase')));
+          const failures = cases.flatMap(test => Array.from(test.querySelectorAll('failure')));
+          const skipped = cases.flatMap(test => Array.from(test.querySelectorAll('skipped')));
+          const mode = process.env.VERIFY_IMPLEMENTATION;
+          assert(paths.length > 0, 'No JUnit results were produced');
+          assert.equal(skipped.length, 0, 'No skipped tests are allowed');
+          let result;
+          if (mode === 'upstream' || mode === 'submitted') {
+            assert.equal(process.env.CYPRESS_OUTCOME, 'failure');
+            assert.equal(cases.length, 2);
+            assert.equal(failures.length, 1);
+            const failure = failures[0].getAttribute('message') + '\n' + failures[0].textContent;
+            assert.doesNotMatch(failure, /detached/i);
+            const failingCase = failures[0].parentElement.getAttribute('name');
+            if (mode === 'upstream') {
+              assert.match(failingCase, /preserves a draft/);
+              assert.match(failure, /selectionStart.*value 5.*value was 0/s);
+              result = 'Expected upstream regression reproduced: selectionStart is 0 instead of 5. Removal regression passed.';
+            } else {
+              assert.match(failingCase, /restores focus/);
+              assert.match(failure, /expected.*button.*focused/s);
+              result = 'Expected submitted-code regression reproduced: the remaining button was not focused. Draft-preservation regression passed.';
+            }
+            result += '\n' + failure;
+          } else {
+            assert.equal(process.env.CYPRESS_OUTCOME, 'success');
+            assert.equal(cases.length, mode === 'patched' ? 47 : 1);
+            assert.equal(failures.length, 0);
+            result = `${cases.length} tests passed with no failures or skips.`;
+            if (mode === 'diagnostic') {
+              result += '\n' + fs.readFileSync('results/iframe-lifecycle.json', 'utf8');
+            }
+          }
+          result += '\n' + fs.readFileSync(`results/${process.env.CYPRESS_BROWSER}-version.txt`, 'utf8').trim();
+          result += '\nProduction index.js SHA-256: ' + crypto.createHash('sha256').update(fs.readFileSync('index.js')).digest('hex');
+          console.log(result);
+          console.log('::notice title=Verified result::' + result.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A'));
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, result + '\n');
+          fs.writeFileSync('results/verification-result.txt', result + '\n');
+          JS
 
       - name: Upload evidence
         if: always()
